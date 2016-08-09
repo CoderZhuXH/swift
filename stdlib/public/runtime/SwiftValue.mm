@@ -38,19 +38,30 @@ using namespace swift;
 // TODO: Making this a SwiftObject subclass would let us use Swift refcounting,
 // but we would need to be able to emit SwiftValue's Objective-C class object
 // with the Swift destructor pointer prefixed before it.
+//
+// The layout of `SwiftValue` is:
+// - object header,
+// - `SwiftValueHeader` instance,
+// - the payload, tail-allocated (the Swift value contained in this box).
 @interface SwiftValue : NSObject <NSCopying>
 
 - (id)copyWithZone:(NSZone *)zone;
 
 @end
 
-static constexpr const size_t SwiftValueMetadataOffset
+/// The fixed-size ivars of `SwiftValue`.  The actual boxed value is
+/// tail-allocated.
+struct SwiftValueHeader {
+  const Metadata *type;
+};
+
+static constexpr const size_t SwiftValueHeaderOffset
   = sizeof(Class); // isa pointer
 static constexpr const size_t SwiftValueMinAlignMask
   = alignof(Class) - 1;
 /* TODO: If we're able to become a SwiftObject subclass in the future,
  * change to this:
-static constexpr const size_t SwiftValueMetadataOffset
+static constexpr const size_t SwiftValueHeaderOffset
   = sizeof(SwiftObject_s);
 static constexpr const size_t SwiftValueMinAlignMask
   = alignof(SwiftObject_s) - 1;
@@ -59,7 +70,7 @@ static constexpr const size_t SwiftValueMinAlignMask
 static Class _getSwiftValueClass() {
   auto theClass = [SwiftValue class];
   // Fixed instance size of SwiftValue should be same as object header.
-  assert(class_getInstanceSize(theClass) == SwiftValueMetadataOffset
+  assert(class_getInstanceSize(theClass) == SwiftValueHeaderOffset
          && "unexpected size of SwiftValue?!");
   return theClass;
 }
@@ -68,63 +79,62 @@ static Class getSwiftValueClass() {
   return SWIFT_LAZY_CONSTANT(_getSwiftValueClass());
 }
 
-static constexpr size_t getSwiftValueOffset(size_t alignMask) {
-  return SwiftValueMetadataOffset + sizeof(const Metadata *)
-    + alignMask & ~alignMask;
+static constexpr size_t getSwiftValuePayloadOffset(size_t alignMask) {
+  return (SwiftValueHeaderOffset + sizeof(SwiftValueHeader) + alignMask) &
+         ~alignMask;
+}
+
+static SwiftValueHeader *getSwiftValueHeader(SwiftValue *v) {
+  auto instanceBytes = reinterpret_cast<char *>(v);
+  return reinterpret_cast<SwiftValueHeader *>(instanceBytes +
+                                              SwiftValueHeaderOffset);
+}
+
+static OpaqueValue *getSwiftValuePayload(SwiftValue *v, size_t alignMask) {
+  auto instanceBytes = reinterpret_cast<char *>(v);
+  return reinterpret_cast<OpaqueValue *>(instanceBytes +
+                                         getSwiftValuePayloadOffset(alignMask));
 }
 
 const Metadata *swift::getSwiftValueTypeMetadata(SwiftValue *v) {
-  auto instanceBytes = reinterpret_cast<const char*>(v);
-  const Metadata *result;
-  memcpy(&result, instanceBytes + SwiftValueMetadataOffset,
-         sizeof(result));
-  return result;
+  return getSwiftValueHeader(v)->type;
 }
 
 std::pair<const Metadata *, const OpaqueValue *>
 swift::getValueFromSwiftValue(SwiftValue *v) {
-  auto instanceBytes = reinterpret_cast<const char*>(v);
   auto instanceType = getSwiftValueTypeMetadata(v);
-  size_t alignMask = instanceType->getValueWitnesses()->getAlignmentMask()
-    | SwiftValueMinAlignMask;
-  auto instanceOffset = getSwiftValueOffset(alignMask);
-  auto value = reinterpret_cast<const OpaqueValue *>(
-    instanceBytes + instanceOffset);
-  return {instanceType, value};
+  size_t alignMask = instanceType->getValueWitnesses()->getAlignmentMask() |
+                     SwiftValueMinAlignMask;
+  return {instanceType, getSwiftValuePayload(v, alignMask)};
 }
 
 SwiftValue *swift::bridgeAnythingToSwiftValueObject(OpaqueValue *src,
                                                     const Metadata *srcType,
                                                     bool consume) {
-  Class SwiftValueClass = getSwiftValueClass();
-  
-  // We lay out the metadata after the object header, and the value after
-  // the metadata (rounded up to alignment).
   size_t alignMask = srcType->getValueWitnesses()->getAlignmentMask()
                    | SwiftValueMinAlignMask;
-  size_t valueOffset = SwiftValueMetadataOffset + sizeof(const Metadata *)
-    + alignMask & ~alignMask;
-  
-  size_t totalSize = valueOffset + srcType->getValueWitnesses()->size;
-  
+
+  size_t totalSize =
+      getSwiftValuePayloadOffset(alignMask) + srcType->getValueWitnesses()->size;
+
   void *instanceMemory = swift_slowAlloc(totalSize, alignMask);
   SwiftValue *instance
-    = objc_constructInstance(SwiftValueClass, instanceMemory);
+    = objc_constructInstance(getSwiftValueClass(), instanceMemory);
   /* TODO: If we're able to become a SwiftObject subclass in the future,
    * change to this:
-  auto instance = swift_allocObject(SwiftValueClass, totalSize, alignMask);
+  auto instance = swift_allocObject(getSwiftValueClass(), totalSize,
+                                    alignMask);
    */
-  
-  auto instanceBytes = reinterpret_cast<char*>(instance);
-  memcpy(instanceBytes + SwiftValueMetadataOffset, &srcType,
-         sizeof(const Metadata*));
-  auto instanceValue = reinterpret_cast<OpaqueValue *>(
-    instanceBytes + valueOffset);
-  
+
+  auto header = getSwiftValueHeader(instance);
+  new (header) SwiftValue();
+  header->type = srcType;
+
+  auto payload = getSwiftValuePayload(instance, alignMask);
   if (consume)
-    srcType->vw_initializeWithTake(instanceValue, src);
+    srcType->vw_initializeWithTake(payload, src);
   else
-    srcType->vw_initializeWithCopy(instanceValue, src);
+    srcType->vw_initializeWithCopy(payload, src);
   
   return instance;
 }
@@ -162,20 +172,17 @@ SwiftValue *swift::getAsSwiftValue(id object) {
 - (void)dealloc {
   // TODO: If we're able to become a SwiftObject subclass in the future,
   // this should move to the heap metadata destructor function.
-  
+
   // Destroy the contained value.
-  auto instanceBytes = reinterpret_cast<char*>(self);
   auto instanceType = getSwiftValueTypeMetadata(self);
-  size_t alignMask = instanceType->getValueWitnesses()->getAlignmentMask()
-    | SwiftValueMinAlignMask;
-  auto instanceOffset = getSwiftValueOffset(alignMask);
-  auto value = reinterpret_cast<OpaqueValue *>(
-    instanceBytes + instanceOffset);
-  instanceType->vw_destroy(value);
-  
+  size_t alignMask = instanceType->getValueWitnesses()->getAlignmentMask() |
+                     SwiftValueMinAlignMask;
+  instanceType->vw_destroy(getSwiftValuePayload(self, alignMask));
+
   // Deallocate ourselves.
   objc_destructInstance(self);
-  auto totalSize = instanceOffset = instanceType->getValueWitnesses()->size;
+  auto totalSize = getSwiftValuePayloadOffset(alignMask) +
+                   instanceType->getValueWitnesses()->size;
   swift_slowDealloc(self, totalSize, alignMask);
 }
 #pragma clang diagnostic pop
@@ -211,8 +218,20 @@ static NSString *getValueDescription(SwiftValue *self) {
   return getValueFromSwiftValue(self).second;
 }
 
-// TODO: Forward isEqual: and hash to
-// corresponding operations on the boxed Swift type.
+- (BOOL)isEqual:(id)other {
+  if (self == other) {
+    return YES;
+  }
+  if (!other) {
+    return NO;
+  }
+
+  return self == other;
+}
+
+- (NSUInteger)hash {
+  return (NSUInteger)self;
+}
 
 @end
 
